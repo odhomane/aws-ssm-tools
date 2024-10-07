@@ -8,6 +8,8 @@ import argparse
 from typing import Dict, List, Any, Tuple
 
 import botocore.session
+from tabulate import tabulate  # Import tabulate for table formatting
+from operator import itemgetter
 
 from .common import AWSSessionBase
 
@@ -58,13 +60,6 @@ class InstanceResolver(AWSSessionBase):
 
         tries = 5
         while tries:
-            # The SSM inventory sometimes returns instances that have been terminated
-            # a short while ago which makes the following call fail
-            # with InvalidInstanceID.NotFound exception. We'll try and remove the invalid
-            # instance ids a {tries} times or until we succeed. If unsuccessful we'll remove
-            # the list obtained from SSM without extra details (host name, public IPs, etc).
-            # This mostly / only affects accounts with high churn of starting / stopping
-            # instances - most users will pass this loop only once.
             try:
                 response_iterator = paginator.paginate(InstanceIds=ec2_instance_ids)
                 for reservations in response_iterator:
@@ -96,10 +91,8 @@ class InstanceResolver(AWSSessionBase):
                 message = ex.response.get("Error", {}).get("Message", "")
                 if not message.startswith("The instance ID") or not message.endswith("not exist"):
                     logger.warning("Unexpected InvalidInstanceID.NotFound message: %s", message)
-                # Try to extract instace ids ...
                 remove_instance_ids = re.findall("i-[0-9a-f]+", message)
                 logger.debug("Removing non-existent InstanceIds: %s", remove_instance_ids)
-                # Remove the failed ids from the list and try again
                 ec2_instance_ids = list(set(ec2_instance_ids) - set(remove_instance_ids))
                 tries -= 1
 
@@ -108,26 +101,66 @@ class InstanceResolver(AWSSessionBase):
 
         return items
 
-    def print_list(self) -> None:
-        hostname_len = 1  # Minimum of 1 char, otherwise f-string below fails for empty hostnames
-        instname_len = 1
 
+    def print_list(self) -> None:
+        """
+        Print a list of instances sorted alphabetically by 'Instance Name', with a dark green header bar and properly aligned column borders.
+        This version swaps the positions of 'Instance Name' and 'Hostname'.
+        """
         items = self.get_list().values()
 
         if not items:
             logger.warning("No instances registered in SSM!")
             return
 
-        items_list = list(items)
-        del items
-        items_list.sort(key=lambda x: x.get("InstanceName") or x.get("HostName"))  # type: ignore
+        # Prepare data for tabular output, swapping 'Hostname' and 'Instance Name'
+        instance_data = []
+        for item in items:
+            instance_data.append([
+                item['InstanceId'],
+                item.get('HostName', ''),     # Hostname first
+                item.get('InstanceName', ''), # Instance Name second
+                ', '.join(item.get('Addresses', []))
+            ])
 
-        for item in items_list:
-            hostname_len = max(hostname_len, len(item["HostName"]))
-            instname_len = max(instname_len, len(item["InstanceName"]))
+        # Sort the instance data by 'Instance Name' (now the third column after swapping)
+        instance_data.sort(key=itemgetter(2))  # Sort by the third column (Instance Name)
 
-        for item in items_list:
-            print(f"{item['InstanceId']:20}   {item['HostName']:{hostname_len}}   {item['InstanceName']:{instname_len}}   {' '.join(item['Addresses'])}")
+        # ANSI color codes for the darker green header (dark green background and white text)
+        HEADER_COLOR = '\033[48;5;22m\033[97m'  # Dark green background (color 22) and white text
+        RESET_COLOR = '\033[0m'                 # Reset to default color
+
+        # Define headers with color (swapping 'Instance Name' and 'Hostname')
+        headers = [
+            f"{HEADER_COLOR} Instance ID {RESET_COLOR}",
+            f"{HEADER_COLOR} Hostname {RESET_COLOR}",
+            f"{HEADER_COLOR} Instance Name {RESET_COLOR}",
+            f"{HEADER_COLOR} IP Addresses {RESET_COLOR}"
+        ]
+
+        # Calculate column widths based on the longest row in each column (after swapping and sorting)
+        col_widths = [
+            max(len(item[0]) for item in instance_data),
+            max(len(item[1]) for item in instance_data),
+            max(len(item[2]) for item in instance_data),
+            max(len(item[3]) for item in instance_data)
+        ]
+
+        # Adjust the width by adding extra space for the column borders and padding
+        col_widths = [w + 2 for w in col_widths]
+
+        # Print the header with dynamic widths, ensuring proper column alignment
+        print(f"{HEADER_COLOR} {'Instance ID':<{col_widths[0]}}| {'Hostname':<{col_widths[1]}} | {'Instance Name':<{col_widths[2]}} | {'IP Addresses':<{col_widths[3]}} {RESET_COLOR}")
+
+        # Print a separator below the header that matches the table width
+        total_width = sum(col_widths) + 3 * 4  # 3 for each border '|' and 4 columns
+        print("─" * total_width)
+
+        # Now print the rows with dynamic column widths and proper alignment
+        for row in instance_data:
+            print(f"{row[0]:<{col_widths[0]}} | {row[1]:<{col_widths[1]}} | {row[2]:<{col_widths[2]}} | {row[3]:<{col_widths[3]}}")
+
+
 
     def resolve_instance(self, instance: str) -> Tuple[str, Dict[str, Any]]:
         # Is it a valid Instance ID?
@@ -153,6 +186,9 @@ class InstanceResolver(AWSSessionBase):
 
         # Found only one instance - return it
         return instances[0], items[instances[0]]
+
+# ContainerResolver code remains unchanged and can be included if needed.
+
 
 
 class ContainerResolver(AWSSessionBase):
